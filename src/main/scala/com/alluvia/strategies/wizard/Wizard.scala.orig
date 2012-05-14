@@ -1,0 +1,379 @@
+package com.alluvia.strategies.wizard
+
+import scala.math.{abs, log}
+import collection.mutable.{ListBuffer, HashMap}
+import com.alluvia.types.benchmark.BTrade
+import com.alluvia.types.DayStart
+import com.alluvia.types.DayEnd
+import com.alluvia.types.{DayStart, DayEnd}
+import com.alluvia.algo.Live
+import com.alluvia.algo.EventAlgo
+import com.alluvia.algo.{Live, EventAlgo}
+import java.util.Date
+import com.alluvial.mds.contract.{QuoteFull, Quote, QuoteMatch, Trade}
+import com.alluvia.strategies.sunset.SunsetSignal
+import com.alluvia.types.benchmark.BTrade
+
+trait Wizard
+  extends EventAlgo {
+
+  // Algorithm parameters
+  // ------------------------------------------------------------
+
+  // Thresholds
+  val thresholdDailyTradesMin = 50 // x
+  val thresholdDailyValueMin = 100000 // $
+  val thresholdLastSpreadMax = 3.0 // %
+  val thresholdAuctionPriceMin = 0.5 // %
+  val thresholdAuctionPriceMax = 10 // %
+  val thresholdDeltaRelSpreadMin = 50 // %
+  val thresholdAuctionValueMin: Int = 10000 // $
+
+  // Position limits
+  val positionSizeMax = 50000 // $
+  val positionSizeMin = 8000 // $
+  val positionSizeRelAuc = 20 // %
+
+  override def benchmarkDays = 1
+  val benchmarkEvents = 20
+
+  // Recent trades
+  val recentEvent = new HashMap[String, ListBuffer[Trade]]
+  val recentTime = new HashMap[String, ListBuffer[Trade]]
+  val numEvents = 20
+
+  // Trading opportunities
+  val tradeSignals = new HashMap[String, SunsetSignal]
+
+  // START BENCHMARKING
+  val benchmarkTrades = new HashMap[String, Int]
+  val benchmarkValues = new HashMap[String, Double]
+
+  // Only trade once
+  var hasTraded = false
+
+  // HTML hack
+  var lastPrint = System.currentTimeMillis()
+
+  override def onQuoteFull {
+   // println("onQuoteFull - " + quoteFull.Security + "," + quoteFull.HighPrice + "," + quoteFull.LowPrice + " " + quoteFull.CumValue)
+  }
+
+  override def onBenchmarkTrade {
+
+    if (!benchmarkTrades.contains(security)) benchmarkTrades.put(security, 0)
+    if (!benchmarkValues.contains(security)) benchmarkValues.put(security, 0)
+    val tradeCount = benchmarkTrades(security) + 1
+    benchmarkTrades.put(security, tradeCount)
+    benchmarkValues.put(security, value)
+  }
+
+  // ON TRADE
+  override def onTrade(trade: Trade) {
+
+  //  println("onLivetrade" + trade.TradeTime + trade.Security + " " + trade.TradePrice)
+
+    /*
+    // Store recent trades by event
+    if (!recentEvent.contains(trade.Security)) {
+      recentEvent.put(trade.Security, ListBuffer(trade))
+    }
+    else {
+      val recentTrades = recentEvent(trade.Security)
+      if (recentTrades.size == numEvents) {
+        recentTrades.trimStart(1)
+      }
+      recentTrades.append(trade)
+      recentEvent.put(trade.Security, recentTrades)
+    }
+    */
+
+    // Store recent trades by time
+    if (trade.TradeTime > (closeTime - 30.minutes)) {
+      addDistribution(trade.Security, trade.TradePrice)
+    }
+
+  }
+
+  override def onQuote {
+    //println("onLiveQuote" + quote.Security + " " + quote.BidOrAsk + " " + quote.Price)
+  }
+
+
+  // ================================================================================
+  // CURRENT DAY
+  // ================================================================================
+
+  // Apply sunset algorithm to individual securities on QuoteMatch events
+  // --------------------------------------------------------------------------------
+
+  override def onQuoteMatch {
+
+      if (date.before(closeTime)) return
+      //println("quotematch " + securityId + " " + quoteMatch.UpdateTime + " " + security)
+
+      if (!lastAsk.contains(security) || !lastBid.contains(security) || !lastTrade.contains(security)) return
+
+
+      // Calculate algorithm inputs
+      // ------------------------------------------------------------
+
+      val askLast = lastAsk(security).Price
+      val bidLast = lastBid(security).Price
+      val midLast = (askLast + bidLast) / 2
+
+      val spreadLast = round4(askLast - bidLast)
+      val spreadLastPercent = round2(100 * spreadLast / midLast)
+
+      // Indicative uncrossing price change and value
+      val auctionDelta = round2(100 * log(matchPrice / midLast))
+
+
+      // Apply algorithm filter rules
+      // ------------------------------------------------------------
+
+      // IF historically there is presumably insufficient liquidity to get out tomorrow THEN break
+      val trades = dailyTrades(security)
+      val value = dailyValues(security)
+      val dailyTradesBenchmark = benchmarkTrades.getOrElse(security, 0) / (benchmarkDays).toDouble
+      val dailyValueBenchmark = benchmarkValues.getOrElse(security, 0.0) / (benchmarkDays).toDouble
+      if (//trades < thresholdDailyTradesMin ||
+        dailyTradesBenchmark < thresholdDailyTradesMin ||
+        //value < thresholdDailyValueMin ||
+        dailyValueBenchmark < thresholdDailyValueMin) {
+        removeStaleOrder(security)
+        return
+      }
+
+      // IF auction price change exceeds maximum threshold THEN break
+      if (abs(auctionDelta) > thresholdAuctionPriceMax) {
+        removeStaleOrder(security)
+        return
+      }
+
+      // IF auction price change does not exceed transaction costs THEN break
+      if (abs(auctionDelta) < thresholdAuctionPriceMin) {
+        removeStaleOrder(security)
+        return
+      }
+
+      // IF auction price change is not unusual vis a vis the last spread THEN break
+      if (abs(auctionDelta) < (thresholdDeltaRelSpreadMin / 100) * spreadLastPercent ||
+        spreadLastPercent > thresholdLastSpreadMax ||
+        spreadLastPercent < 0) {
+        removeStaleOrder(security)
+        return
+      }
+
+      // IF auction price change has insufficient value THEN break
+      if (matchValue < thresholdAuctionValueMin) {
+        removeStaleOrder(security)
+        return
+      }
+
+      // IF security is inactive during the afternoon THEN break
+      if (!distributions.contains(security)) {
+        return
+      }
+
+      // IF close price is not unusual to pre-auction activity THEN break
+      /*
+      val recentTrades = recentEvent(security).sortBy(_.TradePrice)
+      val maxPriceAfternoon = recentTrades.last.TradePrice
+      val minPriceAfternoon = recentTrades.head.TradePrice
+      */
+
+      val maxPriceAfternoon = distributions(security).getMax
+      val minPriceAfternoon = distributions(security).getMin
+      if ((auctionDelta > 0 && matchPrice < minPriceAfternoon) ||
+        (auctionDelta < 0 && matchPrice > maxPriceAfternoon)) {
+        removeStaleOrder(security)
+        return
+      }
+
+      // IF auction delta positive but security cannot be shorted THEN break
+      if (auctionDelta > 0 && !isShortable(security)) {
+        return
+      }
+
+      // ELSE this is an opportunity to trade
+      // ------------------------------------------------------------------------------
+      //  var signal = List[SunsetSignal]
+
+      // Add stock details to today's list of trading signals
+      val signal = new SunsetSignal(security,
+        date,
+        trades,
+        dailyTradesBenchmark,
+        value,
+        dailyValueBenchmark,
+        bidLast,
+        askLast,
+        midLast,
+        spreadLast,
+        spreadLastPercent,
+        matchPrice,
+        auctionDelta,
+        maxPriceAfternoon,
+        minPriceAfternoon,
+        matchValue,
+        matchVolume)
+      tradeSignals.put(security, signal)
+
+      if (date.after(auctionNearFinishTime) && !hasTraded) {
+
+        hasTraded = true
+
+        // Rank opportunities
+        val sortedSignal = tradeSignals.values.toList.sortBy(x => -abs(x.auctionDelta))
+
+        // Print sorted
+        for (current <- sortedSignal) {
+
+          // Display
+          println("\n------------------------")
+          println(current.closeDateTime)
+          println(current.stock)
+          println("Trades: " + current.dailyTrades + " Benchmark: " + current.dailyTradesBenchmark)
+          println("Value: $" + round2(current.dailyValue) + " Benchmark: $" + round2(current.dailyValueBenchmark))
+          println("Last bid: $" + round3(current.bidLast) + " Last ask: $" + round3(current.askLast) + " Last mid: $" + round3(current.midLast))
+          println("Last spread: $" + round3(current.spreadLast) + "(" + round2(current.spreadLastPercent) + "%)")
+          println("Close price: $" + round3(current.closePrice))
+          println("Auction change: " + round2(current.auctionDelta) + "%")
+          println("Afternoon trading range: " + round3(current.minPriceAfternoon) + " to " + round3(current.maxPriceAfternoon) + " (" + round2(100 * log(current.maxPriceAfternoon / current.minPriceAfternoon)) + "%)")
+          println("Close volume: " + current.closeVolume + " Close value: $" + round2(current.closeValue))
+          println("Stats: max - " + distributions(security).getMax + distributions(security).getMean)
+          var sign = 1
+          if (current.auctionDelta > 0) sign = -1
+          var volume = (current.closeVolume * positionSizeRelAuc / 100).toInt
+
+          if (volume * current.closePrice > positionSizeMax) volume = (positionSizeMax / current.closePrice).toInt
+
+        }
+      }
+
+    // Always print HTML hack
+    val currentTime = System.currentTimeMillis()
+    if (currentTime - lastPrint > 1.second) {
+      lastPrint = System.currentTimeMillis()
+      // Rank opportunities
+      val sortedSignal = tradeSignals.values.toList.sortBy(x => -abs(x.auctionDelta))
+      val html = new StringBuffer
+      html.append("<html><head><meta http-equiv=\"refresh\" content=\"1\"></head>")
+      html.append("<table border=1><tr><td>Security</td>" +
+        "<td>Last Bid</td>" +
+        "<td>Last Ask</td>" +
+        "<td>Last Spread (%)</td>" +
+        "<td>Last Mid</td>" +
+        "<td>Close Price</td>" +
+        "<td>Close Value</td>" +
+        "<td>Delta</td>" +
+        "<td>Trade Price</td>" +
+        "<td>Trade Volume</td>" +
+        "<td>Direction</td>" +
+        "</tr>")
+
+      // Print sorted
+      for (current <- sortedSignal) {
+
+        var tradePrice = 0.0
+        if (current.auctionDelta < 0) {
+          tradePrice = current.midLast * (1 - thresholdAuctionPriceMin / 100)
+          if (tradePrice > current.bidLast) tradePrice = current.bidLast
+        }
+        else {
+          tradePrice = current.midLast * (1 + thresholdAuctionPriceMin / 100)
+          if (tradePrice < current.askLast) tradePrice = current.askLast
+        }
+
+        val direction = if (current.auctionDelta > 0) "SELL" else "BUY"
+        val tradeVolume = thresholdAuctionValueMin / tradePrice
+
+        html.append("<tr><td>" + (current.stock) + "</td>" +
+          "<td>" + round3(current.bidLast) + "</td>" +
+          "<td>" + round3(current.askLast) + "</td>" +
+          "<td>" + round2(current.spreadLastPercent) + "</td>" +
+          "<td>" + round3(current.midLast) + "</td>" +
+          "<td>" + round2(current.closePrice) + "</td>" +
+          "<td>" + round2(current.closeValue) + "</td>" +
+          "<td>" + round2(current.auctionDelta) + "</td>" +
+          "<td>" + round2(tradePrice) + "</td>" +
+          "<td>" + tradeVolume.toInt + "</td>" +
+          "<td>" + direction + "</td>" +
+          "</tr>")
+      }
+
+      html.append("</table>")
+      writeFile("sunset.html", html.toString)
+      println(new Date)
+      pscpToServer(".", "sunset.html", "", "index.html", 60)
+    }
+
+  }
+
+    /**
+   * use pscp to transfer files to the server
+   * @localDir - Directory including the trailing slash
+   * @remoteDir - Directory without the trailing slash
+   *
+   */
+  def pscpToServer(localDir: String, localFile: String, remoteDir: String, remoteFile: String, timeoutInSeconds: Long): Unit = {
+    def isAlive(p: Process): Boolean = {
+      try {
+        p.exitValue
+        return false
+      }
+      catch {
+        case e: IllegalThreadStateException => {
+          return true
+        }
+      }
+    }
+    val cleanedDir = if (localDir.charAt(localDir.length - 1) != '\\') localDir + "\\" else localDir
+
+    var command: String = "pscp -q -P 22 -pw 147bvchn " + cleanedDir + localFile + " owner@alluvial-db.cmcrc.com:\"/var/www" + remoteDir + "/" + remoteFile + "\""
+    System.out.println("running - " + command)
+    try {
+      var process: Process = Runtime.getRuntime.exec(command)
+      if (timeoutInSeconds <= 0) {
+        process.waitFor
+      }
+      else {
+        var now: Long = System.currentTimeMillis
+        var timeoutInMillis: Long = 1000L * timeoutInSeconds
+        var finish: Long = now + timeoutInMillis
+        while (isAlive(process) && (System.currentTimeMillis < finish)) {
+
+          Thread.sleep(1000)
+        }
+        if (isAlive(process)) {
+          throw new InterruptedException("Process timeout out after " + timeoutInSeconds + " seconds")
+        }
+      }
+      var returnCode: Int = process.waitFor
+      if (0 == returnCode) {
+        System.out.println("finished normally")
+      }
+      else {
+        System.err.println("Abnormal pscp termination")
+      }
+    }
+    catch {
+      case ex: Exception => {
+        ex.printStackTrace
+      }
+    }
+  }
+
+  override def onDayStart(dayStart: DayStart) {
+    println("startng" + dayStart.dateTime)
+  println(benchmarkValues("PRY"))
+  }
+
+  def removeStaleOrder(security: String) {
+    if (tradeSignals.contains(security)) {
+      tradeSignals.remove(security)
+    }
+  }
+
+}

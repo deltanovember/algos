@@ -1,0 +1,15 @@
+package com.alluvia.strategies.irev
+
+import com.alluvia.algo.EventAlgo
+import com.alluvial.mds.contract.{Quote, Trade}
+import collection.mutable.{ListBuffer, HashMap}
+import com.alluvia.strategies.sunset.SunsetSignal
+
+import scala.math.{abs, log}
+
+trait IRev
+  extends EventAlgo {
+
+
+
+}
